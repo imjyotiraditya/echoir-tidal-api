@@ -6,10 +6,22 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 APP_TITLE = "Echoir Tidal API"
 APP_VERSION = "v1.0"
+# Storage mode options: "kv", "redis", or "auto"
+# - "kv": Use only Cloudflare KV
+# - "redis": Use only Redis
+# - "auto": Start with KV, automatically fall back to Redis when needed (recommended for production)
+STORAGE_PREFERENCE = "auto"
 
+# Upstash Redis configuration (only needed if using Redis)
+# Get these values from your Upstash Redis dashboard
+UPSTASH_REDIS_URL = "https://your-database.upstash.io"
+UPSTASH_REDIS_TOKEN = "YOUR_UPSTASH_REDIS_TOKEN"
+
+# Cloudflare KV namespace
 [[kv_namespaces]]
 binding = "TIDAL_TOKENS"
-id = "YOUR_KV_NAMESPACE_ID" # Replace with your KV namespace ID
+id = "YOUR_KV_NAMESPACE_ID"  # Replace with your actual KV namespace ID
 
+# Enable logging for debugging
 [observability.logs]
 enabled = true

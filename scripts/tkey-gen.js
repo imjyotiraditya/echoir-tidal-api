@@ -5,11 +5,14 @@
  *
  * This script generates Tidal API tokens for use with Cloudflare Workers.
  * It authenticates with Tidal using device flow and provides the tokens
- * for manual entry into KV storage.
+ * for storage in Cloudflare KV and automatically stores them in Redis if configured.
  */
 
 const https = require("https");
 const readline = require("readline");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
 
 // Client credentials
 const CLIENT_IDS = {
@@ -23,6 +26,89 @@ const CLIENT_SECRETS = {
 };
 
 /**
+ * Check if Redis is configured in wrangler.toml
+ * @returns {Object|null} Redis configuration or null if not configured
+ */
+function getRedisConfig() {
+  try {
+    // Try to read wrangler.toml
+    const wranglerPath = path.resolve(process.cwd(), "wrangler.toml");
+
+    if (!fs.existsSync(wranglerPath)) {
+      return null;
+    }
+
+    const wranglerContent = fs.readFileSync(wranglerPath, "utf8");
+
+    // Simple TOML parsing for Redis URL and token
+    const redisUrlMatch = wranglerContent.match(
+      /UPSTASH_REDIS_URL\s*=\s*["']([^"']+)["']/,
+    );
+    const redisTokenMatch = wranglerContent.match(
+      /UPSTASH_REDIS_TOKEN\s*=\s*["']([^"']+)["']/,
+    );
+    const storagePreference = wranglerContent.match(
+      /STORAGE_PREFERENCE\s*=\s*["']([^"']+)["']/,
+    );
+
+    if (redisUrlMatch && redisTokenMatch) {
+      return {
+        url: redisUrlMatch[1],
+        token: redisTokenMatch[1],
+        preference: storagePreference ? storagePreference[1] : "auto",
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Error reading Redis configuration: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Store tokens directly in Redis
+ * @param {string} url - Redis URL
+ * @param {string} token - Redis token
+ * @param {Array} tokens - Array of token objects with key and value
+ * @returns {Promise<boolean>} Success status
+ */
+async function storeTokensInRedis(url, token, tokens) {
+  try {
+    // Check if @upstash/redis is installed
+    try {
+      require("@upstash/redis");
+    } catch (e) {
+      console.log("Installing @upstash/redis package...");
+      execSync("npm install --no-save @upstash/redis", { stdio: "inherit" });
+    }
+
+    // Now import the Redis class
+    const { Redis } = require("@upstash/redis");
+
+    const redis = new Redis({
+      url: url,
+      token: token,
+    });
+
+    // Store each token
+    for (const t of tokens) {
+      await redis.set(
+        t.key,
+        JSON.parse(t.value),
+        { ex: 86400 }, // 24 hour expiration
+      );
+      console.log(`Stored ${t.key} in Redis`);
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`Error storing tokens in Redis: ${error.message}`);
+    return false;
+  }
+}
+
+/**
  * Tidal Auth Generator class
  */
 class TidalAuthGenerator {
@@ -30,6 +116,7 @@ class TidalAuthGenerator {
     this.authBase = "https://auth.tidal.com/v1";
     this.scope = "r_usr w_usr";
     this.kvNamespace = "TIDAL_TOKENS"; // Make sure this matches your wrangler.toml
+    this.redisConfig = getRedisConfig();
   }
 
   /**
@@ -203,15 +290,15 @@ class TidalAuthGenerator {
   }
 
   /**
-   * Format token data for display
+   * Format token data for display and storing
    * @param {string} sessionType - Session type
    * @param {Object} tokenData - Token data
-   * @returns {string} Formatted token information
+   * @returns {Object} Formatted token information
    */
   formatTokenData(sessionType, tokenData) {
     const key = `tidal_tokens:${sessionType}`;
     const value = JSON.stringify(tokenData, null, 2);
-    return `Key: ${key}\nValue: ${value}`;
+    return { key, value };
   }
 
   /**
@@ -249,22 +336,17 @@ class TidalAuthGenerator {
         updated_at: now.toISOString(),
       };
 
-      console.log(
-        "\nToken generation successful! Now you need to manually add these tokens to your KV namespace.",
-      );
-      console.log("\n====== INSTRUCTIONS ======");
-      console.log("1. Go to your Cloudflare dashboard");
-      console.log("2. Navigate to Storage & Databases → KV");
-      console.log("3. Select your TIDAL_TOKENS namespace");
-      console.log("4. Click 'Add entry'");
-      console.log(
-        "5. For each token below, create an entry with the Key and Value as shown",
-      );
-      console.log("==========================\n");
+      console.log("\nToken generation successful!");
 
-      // Display TV token
+      // Collect all tokens
+      const tokens = [];
+
+      // Add TV token
+      const tvToken = this.formatTokenData("TV", tvTokenData);
+      tokens.push(tvToken);
       console.log("\n=== TV TOKEN ===");
-      console.log(this.formatTokenData("TV", tvTokenData));
+      console.log(`Key: ${tvToken.key}`);
+      console.log(`Value: ${tvToken.value}`);
 
       // Generate and display mobile tokens
       for (const sessionType of ["MOBILE_DEFAULT", "MOBILE_ATMOS"]) {
@@ -274,14 +356,65 @@ class TidalAuthGenerator {
         );
 
         if (mobileResult.success) {
+          const mobileToken = this.formatTokenData(
+            sessionType,
+            mobileResult.data,
+          );
+          tokens.push(mobileToken);
           console.log(`\n=== ${sessionType} TOKEN ===`);
-          console.log(this.formatTokenData(sessionType, mobileResult.data));
+          console.log(`Key: ${mobileToken.key}`);
+          console.log(`Value: ${mobileToken.value}`);
         }
       }
 
+      // Try to store tokens in Redis if configured
+      let redisSuccess = false;
+      if (this.redisConfig) {
+        if (
+          this.redisConfig.preference === "auto" ||
+          this.redisConfig.preference === "redis"
+        ) {
+          console.log("\n====== STORING TOKENS IN REDIS ======");
+          redisSuccess = await storeTokensInRedis(
+            this.redisConfig.url,
+            this.redisConfig.token,
+            tokens,
+          );
+
+          if (redisSuccess) {
+            console.log("✅ Successfully stored tokens in Redis");
+          } else {
+            console.log("❌ Failed to store tokens in Redis");
+          }
+        } else {
+          console.log(
+            "\nRedis is configured but not active (preference set to 'kv')",
+          );
+          console.log("Tokens will not be automatically stored in Redis");
+        }
+      }
+
+      // Display KV instructions (always needed as KV is the primary or fallback)
+      console.log("\n====== KV STORAGE INSTRUCTIONS ======");
+      console.log("1. Go to your Cloudflare dashboard");
+      console.log("2. Navigate to Storage & Databases → KV");
+      console.log("3. Select your TIDAL_TOKENS namespace");
+      console.log("4. Click 'Add entry'");
       console.log(
-        "\nAfter adding all tokens to your KV namespace, deploy your Cloudflare Worker with: npm run deploy",
+        "5. For each token above, create an entry with the Key and Value as shown",
       );
+      console.log("==================================\n");
+
+      console.log(
+        "\nAfter adding all tokens to storage, deploy your Cloudflare Worker with: npm run deploy",
+      );
+
+      if (redisSuccess) {
+        console.log("\n✅ Tokens have been automatically stored in Redis");
+        console.log(
+          "You still need to add them to KV for backup/fallback purposes",
+        );
+      }
     } catch (error) {
       console.error(`\nError: ${error.message}`);
       process.exit(1);

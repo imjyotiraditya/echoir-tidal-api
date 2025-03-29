@@ -15,6 +15,7 @@ A Cloudflare Workers API for interacting with the Tidal music streaming service.
 - **Search Endpoints**: Search for tracks and albums
 - **Status Endpoint**: Check API operational status
 - **Support for High-Quality Audio**: Access FLAC, HI-RES, and Dolby Atmos streams
+- **Redis Integration**: Optional Upstash Redis support for token storage to overcome Cloudflare KV limits
 
 ## Prerequisites
 
@@ -22,6 +23,7 @@ A Cloudflare Workers API for interacting with the Tidal music streaming service.
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (Cloudflare Workers CLI)
 - A Cloudflare account
 - Tidal subscription (for authentication)
+- Optional: [Upstash Redis](https://upstash.com/) account for Redis integration
 
 ## Setup
 
@@ -72,7 +74,21 @@ binding = "TIDAL_TOKENS"
 id = "YOUR_KV_NAMESPACE_ID"  # Replace with your actual KV namespace ID
 ```
 
-5. **Generate Tidal Tokens**
+6. **Configure Redis (Optional)**
+
+If you want to use Redis as a fallback storage option to overcome Cloudflare KV daily limits:
+
+1. Create an [Upstash Redis](https://upstash.com/) database
+2. Add the Redis configuration to your `wrangler.toml`:
+
+```toml
+[vars]
+STORAGE_PREFERENCE = "auto" # Options: "kv", "redis", or "auto"
+UPSTASH_REDIS_URL = "YOUR_UPSTASH_REDIS_URL"
+UPSTASH_REDIS_TOKEN = "YOUR_UPSTASH_REDIS_TOKEN"
+```
+
+7. **Generate Tidal Tokens**
 
 Run the token generator script:
 
@@ -95,7 +111,7 @@ When the script displays the tokens and formatting information, you'll need to:
    - Key: The key shown in the output (e.g., `tidal_tokens:TV`)
    - Value: The JSON value from the output
 
-6. **Deploy to Cloudflare Workers**
+8. **Deploy to Cloudflare Workers**
 
 ```bash
 npm run deploy
@@ -103,11 +119,44 @@ npm run deploy
 
 This will deploy your API to Cloudflare Workers. Note the URL in the output; this is your API's endpoint.
 
+## Storage Options
+
+The API can store authentication tokens in two different storage options:
+
+1. **Cloudflare KV (Default)**: Uses Cloudflare's Key-Value storage
+   - Fast but has daily limits (free tier: 100,000 reads/day, 1,000 writes/day)
+
+2. **Upstash Redis (Optional)**: Uses Redis for token storage
+   - Higher limits but slightly higher latency
+   - Useful as a fallback when KV limits are reached
+
+### Storage Modes
+
+Set the `STORAGE_PREFERENCE` variable in your `wrangler.toml` to control storage behavior:
+
+- `kv`: Use only Cloudflare KV (suitable for development or low-traffic scenarios)
+- `redis`: Use only Redis (for high-traffic scenarios)
+- `auto`: Start with KV, automatically fall back to Redis when KV limits are reached (recommended for production)
+
+### Storage Health Monitoring
+
+You can monitor storage health and statistics via the API:
+
+```bash
+curl https://your-worker-url.workers.dev/api/storage/status
+```
+
+This returns information about:
+- Current storage providers
+- Storage usage statistics
+- Operational status of KV and Redis
+
 ## API Endpoints
 
 ### Status
 
 - `GET /api/status` - Check API status
+- `GET /api/storage/status` - Check storage status and statistics
 
 ### Track Endpoints
 
@@ -161,6 +210,9 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 APP_TITLE = "Echoir Tidal API"        # Customize app title
 APP_VERSION = "v1.0"                  # Customize app version
+STORAGE_PREFERENCE = "auto"           # Storage mode: "kv", "redis", or "auto"
+UPSTASH_REDIS_URL = "YOUR_REDIS_URL"  # Redis URL (if using Redis)
+UPSTASH_REDIS_TOKEN = "YOUR_TOKEN"    # Redis token (if using Redis)
 
 [[kv_namespaces]]
 binding = "TIDAL_TOKENS"
@@ -182,13 +234,39 @@ This will start a local development server using Wrangler.
 
 ## Token Refresh
 
-Tokens are automatically refreshed when they expire. The API handles token management internally.
+Tokens are automatically refreshed when they expire. The API handles token management internally. If KV limits are reached, tokens will be refreshed using Redis (if configured).
 
 If you need to regenerate tokens manually (e.g., if they become invalid), run:
 
 ```bash
 npm run generate-tokens
 ```
+
+## Troubleshooting
+
+### Redis Connection Issues
+
+If you see errors related to Redis connection:
+
+1. Check your Upstash credentials in `wrangler.toml`
+2. Verify your Upstash database is active
+3. Test the Redis connection in the storage status API
+
+### KV Limit Reached
+
+If you see errors about KV limits:
+
+1. Check the storage status API for current usage
+2. Set `STORAGE_PREFERENCE` to "auto" to enable Redis fallback
+3. Consider upgrading your Cloudflare plan for higher KV limits
+
+### Storage Not Switching Automatically
+
+If the system doesn't switch to Redis automatically:
+
+1. Check that `STORAGE_PREFERENCE` is set to "auto"
+2. Verify Redis is properly configured
+3. Check for errors in the storage status API
 
 ## Security Considerations
 

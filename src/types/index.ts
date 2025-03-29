@@ -1,6 +1,13 @@
+import { Redis } from "@upstash/redis/cloudflare";
+
 // Environment interface
 export interface Env {
   TIDAL_TOKENS: KVNamespace;
+  REDIS?: Redis; // Redis instance
+  UPSTASH_REDIS_URL?: string; // Redis URL
+  UPSTASH_REDIS_TOKEN?: string; // Redis Token
+  USE_REDIS?: boolean; // Flag to use Redis instead of KV
+  STORAGE_PREFERENCE?: string; // 'kv', 'redis', or 'auto'
   APP_TITLE: string;
   APP_VERSION: string;
 }
@@ -58,4 +65,13 @@ export interface SearchItem {
   artists: string[];
   modes: string[] | null;
   formats: string[] | null;
+}
+
+// Storage Statistics
+export interface StorageStats {
+  provider: string;
+  reads: number;
+  writes: number;
+  errors: number;
+  status: string;
 }

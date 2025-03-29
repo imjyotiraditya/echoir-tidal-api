@@ -4,6 +4,7 @@ import { TrackController } from "../controllers/track";
 import { AlbumController } from "../controllers/album";
 import { SearchController } from "../controllers/search";
 import { StatusController } from "../controllers/status";
+import { StorageStatusController } from "../controllers/storage-status";
 
 /**
  * Configure all API routes
@@ -23,6 +24,7 @@ export function setupRoutes(app: Hono<{ Bindings: Env }>): void {
   // Search routes
   app.get("/api/search", SearchController.search);
 
-  // Status route
+  // Status routes
   app.get("/api/status", StatusController.getStatus);
+  app.get("/api/storage/status", StorageStatusController.getStorageStatus);
 }
