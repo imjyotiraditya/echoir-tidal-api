@@ -1,0 +1,23 @@
+{
+  "name": "echoir-tidal-api",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "start": "wrangler dev",
+    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.js'",
+    "generate-tokens": "node scripts/tkey-gen.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "base64-js": "^1.5.1",
+    "hono": "^4.7.5",
+    "xml-js": "^1.6.11"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250327.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.6.0"
+  }
+}

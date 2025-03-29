@@ -1,0 +1,15 @@
+name = "tidal-api"
+compatibility_date = "2024-09-23"
+main = "src/index.ts"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+APP_TITLE = "Echoir Tidal API"
+APP_VERSION = "v1.0"
+
+[[kv_namespaces]]
+binding = "TIDAL_TOKENS"
+id = "YOUR_KV_NAMESPACE_ID" # Replace with your KV namespace ID
+
+[observability.logs]
+enabled = true

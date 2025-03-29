@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build output
+dist/
+.wrangler/
+worker/
+build/
+.webpack/
+
+# Environment variables
+.env
+.dev.vars
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~.nib
+.project
+.classpath
+.settings/
+
+# Cloudflare specific
+.cloudflare/
+.wrangler.toml.bak
+
+# Typescript
+tsconfig.tsbuildinfo
+
+# Protect sensitive configuration
+wrangler.toml
+
+# Keep the example
+!wrangler.toml.example
