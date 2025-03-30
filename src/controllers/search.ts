@@ -3,6 +3,7 @@ import { TidalAPI } from "../services/tidal-api";
 import { TidalService } from "../services/tidal-service";
 import { Env } from "../types";
 import { DEFAULT_COUNTRY } from "../config/constants";
+import { UrlHelper } from "../utils/url-helper";
 
 /**
  * Controller for search-related endpoints
@@ -31,11 +32,22 @@ export class SearchController {
       const tidalApi = new TidalAPI(c.env);
       const service = new TidalService(tidalApi);
 
-      let result;
-      if (type === "tracks") {
-        result = await service.searchTracks(query, country);
-      } else {
-        result = await service.searchAlbums(query, country);
+      // Check if query contains a Tidal URL
+      const urlData = UrlHelper.extractTidalId(query);
+      let result = [];
+
+      if (urlData) {
+        // Try URL-based search first
+        result = await service.handleUrlSearch(urlData, type, country);
+      }
+
+      // If no URL was detected or URL search returned no results, use regular search
+      if (result.length === 0) {
+        if (type === "tracks") {
+          result = await service.searchTracks(query, country);
+        } else {
+          result = await service.searchAlbums(query, country);
+        }
       }
 
       return c.json(result);

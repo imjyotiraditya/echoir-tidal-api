@@ -9,6 +9,7 @@ import {
 } from "../types";
 import { httpClient } from "../utils/http-client";
 import { FormatUtils } from "../utils/format-utils";
+import { SearchItem } from "../types";
 import {
   CLIENT_IDS,
   DEFAULT_COUNTRY,
@@ -568,5 +569,72 @@ export class TidalService {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Handle URL-based search
+   * @param url - URL data with id and type
+   * @param requestType - Search type requested (tracks or albums)
+   * @param country - Country code
+   * @returns Search item array or empty array if not found
+   */
+  async handleUrlSearch(
+    url: { id: number; type: "track" | "album" },
+    requestType: string,
+    country: string = DEFAULT_COUNTRY,
+  ): Promise<SearchItem[]> {
+    if (url.type === "track" && requestType === "tracks") {
+      try {
+        const trackInfo = await this.getTrackInfo(url.id, country);
+        if (trackInfo) {
+          return [
+            {
+              id: trackInfo.id,
+              title: trackInfo.title,
+              duration: FormatUtils.formatDuration(trackInfo.duration),
+              explicit: trackInfo.explicit || false,
+              cover: FormatUtils.getCoverUrl(trackInfo.album?.cover),
+              artists: trackInfo.artists
+                ? trackInfo.artists.map((artist: any) => artist.name)
+                : [],
+              formats:
+                trackInfo.mediaMetadata?.tags ||
+                (trackInfo.audioQuality ? [trackInfo.audioQuality] : []),
+              modes: trackInfo.audioModes || null,
+            },
+          ];
+        }
+      } catch (error) {
+        return [];
+      }
+    } else if (url.type === "album" && requestType === "albums") {
+      try {
+        const albumInfo = await this.getAlbumInfo(url.id, country);
+        if (albumInfo) {
+          return [
+            {
+              id: albumInfo.id,
+              title: albumInfo.title,
+              duration: albumInfo.duration
+                ? FormatUtils.formatDuration(albumInfo.duration)
+                : "0:00",
+              explicit: albumInfo.explicit || false,
+              cover: FormatUtils.getCoverUrl(albumInfo.cover, 80, false),
+              artists: albumInfo.artists
+                ? albumInfo.artists.map((artist: any) => artist.name)
+                : [],
+              formats:
+                albumInfo.mediaMetadata?.tags ||
+                (albumInfo.audioQuality ? [albumInfo.audioQuality] : []),
+              modes: albumInfo.audioModes || null,
+            },
+          ];
+        }
+      } catch (error) {
+        return [];
+      }
+    }
+
+    return [];
   }
 }
