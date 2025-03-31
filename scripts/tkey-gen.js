@@ -5,7 +5,7 @@
  *
  * This script generates Tidal API tokens for use with Cloudflare Workers.
  * It authenticates with Tidal using device flow and provides the tokens
- * for storage in Cloudflare KV and automatically stores them in Redis if configured.
+ * for storage in Cloudflare KV, D1, and Redis if configured.
  */
 
 const https = require("https");
@@ -24,6 +24,45 @@ const CLIENT_IDS = {
 const CLIENT_SECRETS = {
   TV: "oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=",
 };
+
+/**
+ * Check if D1 is configured in wrangler.toml
+ * @returns {Object|null} D1 configuration or null if not configured
+ */
+function getD1Config() {
+  try {
+    // Try to read wrangler.toml
+    const wranglerPath = path.resolve(process.cwd(), "wrangler.toml");
+
+    if (!fs.existsSync(wranglerPath)) {
+      return null;
+    }
+
+    const wranglerContent = fs.readFileSync(wranglerPath, "utf8");
+
+    // Simple TOML parsing for D1 database
+    const d1Match = wranglerContent.match(/database_id\s*=\s*["']([^"']+)["']/);
+    const d1NameMatch = wranglerContent.match(
+      /database_name\s*=\s*["']([^"']+)["']/,
+    );
+    const storagePreference = wranglerContent.match(
+      /STORAGE_PREFERENCE\s*=\s*["']([^"']+)["']/,
+    );
+
+    if (d1Match && d1NameMatch) {
+      return {
+        database_id: d1Match[1],
+        database_name: d1NameMatch[1],
+        preference: storagePreference ? storagePreference[1] : "auto",
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Error reading D1 configuration: ${error.message}`);
+    return null;
+  }
+}
 
 /**
  * Check if Redis is configured in wrangler.toml
@@ -63,6 +102,52 @@ function getRedisConfig() {
   } catch (error) {
     console.error(`Error reading Redis configuration: ${error.message}`);
     return null;
+  }
+}
+
+/**
+ * Store tokens directly in D1 database
+ * @param {string} databaseId - D1 database ID
+ * @param {string} databaseName - D1 database name
+ * @param {Array} tokens - Array of token objects with key and value
+ * @returns {boolean} Success status
+ */
+async function storeTokensInD1(databaseId, databaseName, tokens) {
+  try {
+    // Ensure the tokens table exists
+    try {
+      execSync(
+        `npx wrangler d1 execute ${databaseName} --remote --command "CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires TEXT NOT NULL, updated_at TEXT NOT NULL)"`,
+        { stdio: "pipe" },
+      );
+    } catch (error) {
+      console.error(`Error creating tokens table: ${error.message}`);
+      return false;
+    }
+
+    // Store each token
+    for (const t of tokens) {
+      const tokenData = JSON.parse(t.value);
+      const valueEscaped = t.value.replace(/"/g, '\\"');
+
+      const sqlCommand = `INSERT OR REPLACE INTO tokens (key, value, expires, updated_at) VALUES ('${t.key}', '${valueEscaped}', '${tokenData.expires}', '${tokenData.updated_at}');`;
+
+      try {
+        execSync(
+          `npx wrangler d1 execute ${databaseName} --remote --command "${sqlCommand}"`,
+          { stdio: "pipe" },
+        );
+        console.log(`Stored ${t.key} in D1 database`);
+      } catch (error) {
+        console.error(`Error storing token in D1: ${error.message}`);
+        return false;
+      }
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`Error storing tokens in D1: ${error.message}`);
+    return false;
   }
 }
 
@@ -116,6 +201,7 @@ class TidalAuthGenerator {
     this.authBase = "https://auth.tidal.com/v1";
     this.scope = "r_usr w_usr";
     this.kvNamespace = "TIDAL_TOKENS"; // Make sure this matches your wrangler.toml
+    this.d1Config = getD1Config();
     this.redisConfig = getRedisConfig();
   }
 
@@ -367,6 +453,33 @@ class TidalAuthGenerator {
         }
       }
 
+      // Try to store tokens in D1 if configured
+      let d1Success = false;
+      if (this.d1Config) {
+        if (
+          this.d1Config.preference === "auto" ||
+          this.d1Config.preference === "d1"
+        ) {
+          console.log("\n====== STORING TOKENS IN D1 ======");
+          d1Success = await storeTokensInD1(
+            this.d1Config.database_id,
+            this.d1Config.database_name,
+            tokens,
+          );
+
+          if (d1Success) {
+            console.log("✅ Successfully stored tokens in D1");
+          } else {
+            console.log("❌ Failed to store tokens in D1");
+          }
+        } else {
+          console.log(
+            "\nD1 is configured but not active (preference set to 'kv' or 'redis')",
+          );
+          console.log("Tokens will not be automatically stored in D1");
+        }
+      }
+
       // Try to store tokens in Redis if configured
       let redisSuccess = false;
       if (this.redisConfig) {
@@ -388,7 +501,7 @@ class TidalAuthGenerator {
           }
         } else {
           console.log(
-            "\nRedis is configured but not active (preference set to 'kv')",
+            "\nRedis is configured but not active (preference set to 'kv' or 'd1')",
           );
           console.log("Tokens will not be automatically stored in Redis");
         }
@@ -409,12 +522,26 @@ class TidalAuthGenerator {
         "\nAfter adding all tokens to storage, deploy your Cloudflare Worker with: npm run deploy",
       );
 
-      if (redisSuccess) {
-        console.log("\n✅ Tokens have been automatically stored in Redis");
-        console.log(
-          "You still need to add them to KV for backup/fallback purposes",
-        );
+      // Success summary
+      console.log("\n====== TOKEN STORAGE SUMMARY ======");
+      if (d1Success) {
+        console.log("✅ Tokens have been automatically stored in D1");
+      } else if (this.d1Config) {
+        console.log("❌ Failed to store tokens in D1");
+      } else {
+        console.log("⚠️ D1 is not configured in your wrangler.toml");
       }
+
+      if (redisSuccess) {
+        console.log("✅ Tokens have been automatically stored in Redis");
+      } else if (this.redisConfig) {
+        console.log("❌ Failed to store tokens in Redis");
+      } else {
+        console.log("⚠️ Redis is not configured in your wrangler.toml");
+      }
+
+      console.log("⚠️ Don't forget to add tokens to KV (for backup/fallback)");
+      console.log("==================================\n");
     } catch (error) {
       console.error(`\nError: ${error.message}`);
       process.exit(1);

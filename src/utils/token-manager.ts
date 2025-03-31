@@ -1,32 +1,85 @@
 import { httpClient } from "./http-client";
 import { CLIENT_IDS, CLIENT_SECRETS, API_URLS } from "../config/constants";
-import { TokenData, SessionType, Env, StorageStats } from "../types";
+import {
+  TokenData,
+  SessionType,
+  Env,
+  StorageStats,
+  StorageProviderType,
+} from "../types";
 import { StorageProvider } from "./storage/storage-provider";
 import { StorageFactory } from "./storage/storage-factory";
 
 /**
- * Manages Tidal API authentication tokens
+ * Manages Tidal API authentication tokens with tiered storage
  */
 export class TokenManager {
   private storage: StorageProvider;
   private storageStats: StorageStats = {
-    provider: "kv",
+    provider: "d1",
     reads: 0,
     writes: 0,
     errors: 0,
     status: "operational",
   };
-  private kvLimitThresholds = {
-    reads: 95000, // 95% of free tier 100,000 reads/day
-    writes: 950, // 95% of free tier 1,000 writes/day
+
+  // Storage limits
+  private storageLimits = {
+    d1: {
+      reads: 5000000, // 5 million reads/day
+      writes: 100000, // 100,000 writes/day
+      threshold: 0.95, // 95% threshold
+    },
+    kv: {
+      reads: 100000, // 100,000 reads/day
+      writes: 1000, // 1,000 writes/day
+      threshold: 0.95, // 95% threshold
+    },
   };
+
   private consecutiveErrors = 0;
   private errorThreshold = 3; // Number of consecutive errors before forcing switch
 
   constructor(private env: Env) {
+    // Set initial storage preference if not already set
+    if (!this.env.STORAGE_PREFERENCE) {
+      this.env.STORAGE_PREFERENCE = "auto";
+    }
+
+    // Set initial USE_D1 flag based on storage preference and availability
+    if (
+      this.env.D1_DB &&
+      (this.env.STORAGE_PREFERENCE === "d1" ||
+        this.env.STORAGE_PREFERENCE === "auto")
+    ) {
+      this.env.USE_D1 = true;
+    } else {
+      this.env.USE_D1 = false;
+    }
+
+    // Set initial USE_REDIS flag if D1 is not being used
+    if (
+      !this.env.USE_D1 &&
+      this.env.REDIS &&
+      (this.env.STORAGE_PREFERENCE === "redis" ||
+        this.env.STORAGE_PREFERENCE === "auto")
+    ) {
+      this.env.USE_REDIS = true;
+    } else if (this.env.USE_D1) {
+      this.env.USE_REDIS = false;
+    }
+
     // Initialize storage provider using factory
-    this.storage = StorageFactory.createStorage(env);
-    this.storageStats.provider = this.env.USE_REDIS ? "redis" : "kv";
+    this.storage = StorageFactory.createStorage(this.env);
+
+    // Set initial provider in stats
+    if (this.env.USE_D1) {
+      this.storageStats.provider = "d1";
+    } else if (this.env.USE_REDIS) {
+      this.storageStats.provider = "redis";
+    } else {
+      this.storageStats.provider = "kv";
+    }
   }
 
   /**
@@ -38,12 +91,45 @@ export class TokenManager {
   }
 
   /**
-   * Check if KV limits are approaching and we should switch to Redis
-   * @returns True if should switch, false otherwise
+   * Check if D1 limits are approaching and we should switch to KV
    */
-  private shouldSwitchToRedis(): boolean {
-    // Only consider switching if we're using KV and Redis is available
+  private shouldSwitchFromD1ToKV(): boolean {
+    // Only consider switching if we're using D1 and in auto mode
+    if (!this.env.USE_D1 || this.env.STORAGE_PREFERENCE !== "auto") {
+      return false;
+    }
+
+    const d1Limits = this.storageLimits.d1;
+    const readThreshold = d1Limits.reads * d1Limits.threshold;
+    const writeThreshold = d1Limits.writes * d1Limits.threshold;
+
+    // Check if we're approaching D1 limits
     if (
+      this.storageStats.reads >= readThreshold ||
+      this.storageStats.writes >= writeThreshold
+    ) {
+      console.log(
+        `Approaching D1 limits: ${this.storageStats.reads}/${readThreshold} reads, ${this.storageStats.writes}/${writeThreshold} writes`,
+      );
+      return true;
+    }
+
+    // Check if we've had too many consecutive errors
+    if (this.consecutiveErrors >= this.errorThreshold) {
+      console.log(`Too many consecutive D1 errors: ${this.consecutiveErrors}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if KV limits are approaching and we should switch to Redis
+   */
+  private shouldSwitchFromKVToRedis(): boolean {
+    // Only consider switching if we're using KV (not D1, not Redis) and Redis is available and in auto mode
+    if (
+      this.env.USE_D1 ||
       this.env.USE_REDIS ||
       !this.env.REDIS ||
       this.env.STORAGE_PREFERENCE !== "auto"
@@ -51,13 +137,17 @@ export class TokenManager {
       return false;
     }
 
+    const kvLimits = this.storageLimits.kv;
+    const readThreshold = kvLimits.reads * kvLimits.threshold;
+    const writeThreshold = kvLimits.writes * kvLimits.threshold;
+
     // Check if we're approaching KV limits
     if (
-      this.storageStats.reads >= this.kvLimitThresholds.reads ||
-      this.storageStats.writes >= this.kvLimitThresholds.writes
+      this.storageStats.reads >= readThreshold ||
+      this.storageStats.writes >= writeThreshold
     ) {
       console.log(
-        `Approaching KV limits: ${this.storageStats.reads} reads, ${this.storageStats.writes} writes`,
+        `Approaching KV limits: ${this.storageStats.reads}/${readThreshold} reads, ${this.storageStats.writes}/${writeThreshold} writes`,
       );
       return true;
     }
@@ -72,10 +162,29 @@ export class TokenManager {
   }
 
   /**
-   * Switch to Redis storage
+   * Switch storage from D1 to KV
    */
-  private switchToRedis(): void {
-    if (this.env.REDIS && !this.env.USE_REDIS) {
+  private switchFromD1ToKV(): void {
+    if (this.env.USE_D1) {
+      console.log("Switching primary storage from D1 to KV");
+      this.env.USE_D1 = false;
+      this.env.USE_REDIS = false;
+      this.storage = StorageFactory.createStorage(this.env, "kv");
+      this.storageStats.provider = "kv";
+      this.consecutiveErrors = 0;
+
+      // Reset stats for the new provider
+      this.storageStats.reads = 0;
+      this.storageStats.writes = 0;
+      this.storageStats.errors = 0;
+    }
+  }
+
+  /**
+   * Switch storage from KV to Redis
+   */
+  private switchFromKVToRedis(): void {
+    if (!this.env.USE_D1 && !this.env.USE_REDIS && this.env.REDIS) {
       console.log("Switching primary storage from KV to Redis");
       this.env.USE_REDIS = true;
       this.storage = StorageFactory.createStorage(this.env, "redis");
@@ -99,59 +208,132 @@ export class TokenManager {
   }
 
   /**
-   * Get tokens from storage
+   * Get tokens from storage with tiered fallback
    * @param sessionType - Session type
    * @returns Token data
    */
   async getTokens(sessionType: SessionType): Promise<TokenData> {
     try {
-      // Check if we should switch to Redis before proceeding
-      if (this.shouldSwitchToRedis()) {
-        this.switchToRedis();
+      // Check if we should switch storage before proceeding
+      if (this.env.USE_D1 && this.shouldSwitchFromD1ToKV()) {
+        this.switchFromD1ToKV();
+      } else if (
+        !this.env.USE_D1 &&
+        !this.env.USE_REDIS &&
+        this.shouldSwitchFromKVToRedis()
+      ) {
+        this.switchFromKVToRedis();
       }
 
       this.storageStats.reads++;
+      const currentProvider = this.storageStats.provider as
+        | "d1"
+        | "kv"
+        | "redis";
+
+      console.log(
+        `[STORAGE] Using ${currentProvider.toUpperCase()} for reading ${sessionType} tokens`,
+      );
+
       const tokens = await this.storage.getTokens(sessionType);
       this.consecutiveErrors = 0; // Reset error counter on success
+
       return tokens;
     } catch (error) {
       this.storageStats.errors++;
       this.consecutiveErrors++;
+
+      const currentProvider = this.storageStats.provider as
+        | "d1"
+        | "kv"
+        | "redis";
       console.error(
         `Storage error: ${error.message}, consecutive errors: ${this.consecutiveErrors}`,
       );
 
-      // If primary storage fails and we're not already using Redis as backup
-      if (this.env.REDIS && !this.env.USE_REDIS) {
+      // Implement tiered fallback logic
+      if (this.env.USE_D1) {
+        // If D1 fails, try KV
         try {
-          // If auto mode and error is likely a limit issue or persistent error, switch to Redis
+          console.log(
+            `D1 storage failed, trying KV fallback for ${sessionType}`,
+          );
+          const kvStorage = StorageFactory.createStorage(this.env, "kv");
+          const tokens = await kvStorage.getTokens(sessionType);
+
+          // If auto mode and error threshold reached, switch to KV permanently
           if (
             this.env.STORAGE_PREFERENCE === "auto" &&
             (error.status === 429 ||
               this.consecutiveErrors >= this.errorThreshold)
           ) {
-            this.switchToRedis();
-            return await this.storage.getTokens(sessionType);
+            this.switchFromD1ToKV();
           }
 
-          // Otherwise just try Redis as backup without switching
-          console.log(
-            `KV storage failed, trying Redis backup for ${sessionType}`,
-          );
-          const redisStorage = StorageFactory.createStorage(this.env, "redis");
-          return await redisStorage.getTokens(sessionType);
-        } catch (redisError) {
-          // If Redis also fails, throw the original error
-          console.error(`Redis backup also failed: ${redisError.message}`);
-          throw error;
+          return tokens;
+        } catch (kvError) {
+          // If KV also fails and Redis is available, try Redis
+          if (this.env.REDIS) {
+            try {
+              console.log(
+                `KV fallback failed, trying Redis for ${sessionType}`,
+              );
+              const redisStorage = StorageFactory.createStorage(
+                this.env,
+                "redis",
+              );
+
+              return await redisStorage.getTokens(sessionType);
+            } catch (redisError) {
+              // If all options fail, throw the original error
+              console.error(
+                `All storage options failed: ${error.message}, ${kvError.message}, ${redisError.message}`,
+              );
+              throw error;
+            }
+          } else {
+            // If Redis is not available, throw the KV error
+            throw kvError;
+          }
+        }
+      } else if (!this.env.USE_REDIS) {
+        // If using KV and it fails, try Redis if available
+        if (this.env.REDIS) {
+          try {
+            console.log(
+              `KV storage failed, trying Redis fallback for ${sessionType}`,
+            );
+            const redisStorage = StorageFactory.createStorage(
+              this.env,
+              "redis",
+            );
+            const tokens = await redisStorage.getTokens(sessionType);
+
+            // If auto mode and error threshold reached, switch to Redis permanently
+            if (
+              this.env.STORAGE_PREFERENCE === "auto" &&
+              (error.status === 429 ||
+                this.consecutiveErrors >= this.errorThreshold)
+            ) {
+              this.switchFromKVToRedis();
+            }
+
+            return tokens;
+          } catch (redisError) {
+            // If Redis also fails, throw the original error
+            console.error(`Redis fallback also failed: ${redisError.message}`);
+            throw error;
+          }
         }
       }
+
+      // If no fallback options or all fallbacks failed, throw the original error
       throw error;
     }
   }
 
   /**
-   * Update tokens in storage
+   * Update tokens in storage with tiered approach
    * @param tokens - Token data
    * @param sessionType - Session type
    */
@@ -160,56 +342,165 @@ export class TokenManager {
     sessionType: SessionType,
   ): Promise<void> {
     try {
-      // Check if we should switch to Redis before proceeding
-      if (this.shouldSwitchToRedis()) {
-        this.switchToRedis();
+      // Check if we should switch storage before proceeding
+      if (this.env.USE_D1 && this.shouldSwitchFromD1ToKV()) {
+        this.switchFromD1ToKV();
+      } else if (
+        !this.env.USE_D1 &&
+        !this.env.USE_REDIS &&
+        this.shouldSwitchFromKVToRedis()
+      ) {
+        this.switchFromKVToRedis();
       }
 
       this.storageStats.writes++;
+      const currentProvider = this.storageStats.provider as
+        | "d1"
+        | "kv"
+        | "redis";
+
+      console.log(
+        `[STORAGE] Using ${currentProvider.toUpperCase()} for writing ${sessionType} tokens`,
+      );
+
       await this.storage.updateTokens(tokens, sessionType);
       this.consecutiveErrors = 0; // Reset error counter on success
 
-      // If we're not using Redis as primary but it's available, also store there as backup
-      if (
-        this.env.REDIS &&
-        !this.env.USE_REDIS &&
-        this.env.STORAGE_PREFERENCE === "auto"
-      ) {
-        try {
-          const redisStorage = StorageFactory.createStorage(this.env, "redis");
-          await redisStorage.updateTokens(tokens, sessionType);
-        } catch (redisError) {
-          // Log but don't fail if backup storage fails
-          console.error(`Failed to update Redis backup: ${redisError.message}`);
+      // Implement tiered backup strategy
+      if (this.env.STORAGE_PREFERENCE === "auto") {
+        // If using D1, also update KV as a backup
+        if (this.env.USE_D1) {
+          try {
+            console.log(`[STORAGE] Backing up tokens to KV`);
+            const kvStorage = StorageFactory.createStorage(this.env, "kv");
+            await kvStorage.updateTokens(tokens, sessionType);
+          } catch (kvError) {
+            console.error(`Failed to update KV backup: ${kvError.message}`);
+          }
+
+          // If Redis is available, also update it as a second backup
+          if (this.env.REDIS) {
+            try {
+              console.log(`[STORAGE] Backing up tokens to Redis`);
+              const redisStorage = StorageFactory.createStorage(
+                this.env,
+                "redis",
+              );
+              await redisStorage.updateTokens(tokens, sessionType);
+            } catch (redisError) {
+              console.error(
+                `Failed to update Redis backup: ${redisError.message}`,
+              );
+            }
+          }
+        }
+        // If using KV, also update Redis as a backup if available
+        else if (!this.env.USE_REDIS && this.env.REDIS) {
+          try {
+            console.log(`[STORAGE] Backing up tokens to Redis`);
+            const redisStorage = StorageFactory.createStorage(
+              this.env,
+              "redis",
+            );
+            await redisStorage.updateTokens(tokens, sessionType);
+          } catch (redisError) {
+            console.error(
+              `Failed to update Redis backup: ${redisError.message}`,
+            );
+          }
         }
       }
     } catch (error) {
       this.storageStats.errors++;
       this.consecutiveErrors++;
+
+      const currentProvider = this.storageStats.provider as
+        | "d1"
+        | "kv"
+        | "redis";
       console.error(
         `Storage update error: ${error.message}, consecutive errors: ${this.consecutiveErrors}`,
       );
 
-      // If primary storage fails and Redis is available as fallback
-      if (this.env.REDIS && this.env.STORAGE_PREFERENCE === "auto") {
+      // Implement tiered fallback for updates
+      if (this.env.USE_D1) {
+        // If D1 fails, try KV
         try {
-          console.log(
-            `Switching to Redis storage after KV failure: ${error.message}`,
-          );
-          this.switchToRedis();
-          await this.storage.updateTokens(tokens, sessionType);
-          console.log(
-            `Successfully switched to Redis storage for ${sessionType}`,
-          );
-        } catch (redisError) {
-          throw {
-            status: 500,
-            message: `All storage options failed: ${error.message}, Redis: ${redisError.message}`,
-          };
+          console.log(`D1 storage update failed, trying KV for ${sessionType}`);
+          const kvStorage = StorageFactory.createStorage(this.env, "kv");
+          await kvStorage.updateTokens(tokens, sessionType);
+
+          // If auto mode and error threshold reached, switch to KV permanently
+          if (
+            this.env.STORAGE_PREFERENCE === "auto" &&
+            (error.status === 429 ||
+              this.consecutiveErrors >= this.errorThreshold)
+          ) {
+            this.switchFromD1ToKV();
+          }
+
+          return;
+        } catch (kvError) {
+          // If KV also fails and Redis is available, try Redis
+          if (this.env.REDIS) {
+            try {
+              console.log(
+                `KV fallback update failed, trying Redis for ${sessionType}`,
+              );
+              const redisStorage = StorageFactory.createStorage(
+                this.env,
+                "redis",
+              );
+              await redisStorage.updateTokens(tokens, sessionType);
+
+              return;
+            } catch (redisError) {
+              // If all options fail, throw the original error
+              console.error(
+                `All storage update options failed: ${error.message}, ${kvError.message}, ${redisError.message}`,
+              );
+              throw error;
+            }
+          } else {
+            // If Redis is not available, throw the KV error
+            throw kvError;
+          }
         }
-      } else {
-        throw error;
+      } else if (!this.env.USE_REDIS) {
+        // If using KV and it fails, try Redis if available
+        if (this.env.REDIS) {
+          try {
+            console.log(
+              `KV storage update failed, trying Redis for ${sessionType}`,
+            );
+            const redisStorage = StorageFactory.createStorage(
+              this.env,
+              "redis",
+            );
+            await redisStorage.updateTokens(tokens, sessionType);
+
+            // If auto mode and error threshold reached, switch to Redis permanently
+            if (
+              this.env.STORAGE_PREFERENCE === "auto" &&
+              (error.status === 429 ||
+                this.consecutiveErrors >= this.errorThreshold)
+            ) {
+              this.switchFromKVToRedis();
+            }
+
+            return;
+          } catch (redisError) {
+            // If Redis also fails, throw the original error
+            console.error(
+              `Redis fallback update also failed: ${redisError.message}`,
+            );
+            throw error;
+          }
+        }
       }
+
+      // If no fallback options or all fallbacks failed, throw the original error
+      throw error;
     }
   }
 

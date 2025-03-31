@@ -3,11 +3,13 @@ import { Redis } from "@upstash/redis/cloudflare";
 // Environment interface
 export interface Env {
   TIDAL_TOKENS: KVNamespace;
+  D1_DB: D1Database;
   REDIS?: Redis; // Redis instance
   UPSTASH_REDIS_URL?: string; // Redis URL
   UPSTASH_REDIS_TOKEN?: string; // Redis Token
+  USE_D1?: boolean; // Flag to use D1 as primary storage
   USE_REDIS?: boolean; // Flag to use Redis instead of KV
-  STORAGE_PREFERENCE?: string; // 'kv', 'redis', or 'auto'
+  STORAGE_PREFERENCE?: string; // 'auto', 'd1', 'kv', or 'redis'
   APP_TITLE: string;
   APP_VERSION: string;
 }
@@ -75,3 +77,6 @@ export interface StorageStats {
   errors: number;
   status: string;
 }
+
+// Storage Provider Type
+export type StorageProviderType = "d1" | "kv" | "redis";

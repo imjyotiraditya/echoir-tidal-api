@@ -1,7 +1,8 @@
 import { StorageProvider } from "./storage-provider";
 import { KVStorage } from "./kv-storage";
 import { RedisStorage } from "./redis-storage";
-import { Env } from "../../types";
+import { D1Storage } from "./d1-storage";
+import { Env, StorageProviderType } from "../../types";
 
 /**
  * Factory for creating storage providers
@@ -13,9 +14,17 @@ export class StorageFactory {
    * @param forceProvider - Force specific provider
    * @returns Storage provider
    */
-  static createStorage(env: Env, forceProvider?: string): StorageProvider {
+  static createStorage(
+    env: Env,
+    forceProvider?: StorageProviderType,
+  ): StorageProvider {
     // Use forced provider if specified
-    if (forceProvider === "redis") {
+    if (forceProvider === "d1") {
+      if (!env.D1_DB) {
+        throw new Error("D1 is not configured but was requested");
+      }
+      return new D1Storage(env);
+    } else if (forceProvider === "redis") {
       if (!env.REDIS) {
         throw new Error("Redis is not configured but was requested");
       }
@@ -24,9 +33,13 @@ export class StorageFactory {
       return new KVStorage(env);
     }
 
-    // Default behavior: try KV first, fall back to Redis
-    return env.USE_REDIS && env.REDIS
-      ? new RedisStorage(env)
-      : new KVStorage(env);
+    // Default behavior based on configuration
+    if (env.USE_D1 && env.D1_DB) {
+      return new D1Storage(env);
+    } else if (env.USE_REDIS && env.REDIS) {
+      return new RedisStorage(env);
+    } else {
+      return new KVStorage(env);
+    }
   }
 }
