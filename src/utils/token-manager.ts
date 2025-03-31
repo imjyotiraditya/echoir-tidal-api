@@ -10,11 +10,18 @@ import {
 import { StorageProvider } from "./storage/storage-provider";
 import { StorageFactory } from "./storage/storage-factory";
 
+// Interface for cached token
+interface CachedToken {
+  data: TokenData;
+  cachedAt: number;
+}
+
 /**
- * Manages Tidal API authentication tokens with tiered storage
+ * Manages Tidal API authentication tokens with tiered storage and in-memory caching
  */
 export class TokenManager {
   private storage: StorageProvider;
+  private tokenCache: Map<SessionType, CachedToken> = new Map();
   private storageStats: StorageStats = {
     provider: "d1",
     reads: 0,
@@ -22,6 +29,9 @@ export class TokenManager {
     errors: 0,
     status: "operational",
   };
+
+  // Cache configuration
+  private CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache duration
 
   // Storage limits
   private storageLimits = {
@@ -177,6 +187,9 @@ export class TokenManager {
       this.storageStats.reads = 0;
       this.storageStats.writes = 0;
       this.storageStats.errors = 0;
+
+      // Clear token cache to force fresh retrieval
+      this.tokenCache.clear();
     }
   }
 
@@ -195,24 +208,27 @@ export class TokenManager {
       this.storageStats.reads = 0;
       this.storageStats.writes = 0;
       this.storageStats.errors = 0;
+
+      // Clear token cache to force fresh retrieval
+      this.tokenCache.clear();
     }
   }
 
   /**
-   * Get token key for storage
-   * @param sessionType - Session type
-   * @returns Formatted key string
-   */
-  private getTokenKey(sessionType: SessionType): string {
-    return this.storage.getTokenKey(sessionType);
-  }
-
-  /**
-   * Get tokens from storage with tiered fallback
+   * Get tokens with intelligent caching
    * @param sessionType - Session type
    * @returns Token data
    */
   async getTokens(sessionType: SessionType): Promise<TokenData> {
+    const now = Date.now();
+    const cachedToken = this.tokenCache.get(sessionType);
+
+    // Check if cached token exists and is not expired
+    if (cachedToken && now - cachedToken.cachedAt < this.CACHE_DURATION) {
+      console.log(`[CACHE] Using cached token for ${sessionType}`);
+      return cachedToken.data;
+    }
+
     try {
       // Check if we should switch storage before proceeding
       if (this.env.USE_D1 && this.shouldSwitchFromD1ToKV()) {
@@ -238,8 +254,15 @@ export class TokenManager {
       const tokens = await this.storage.getTokens(sessionType);
       this.consecutiveErrors = 0; // Reset error counter on success
 
+      // Cache the token
+      this.tokenCache.set(sessionType, {
+        data: tokens,
+        cachedAt: now,
+      });
+
       return tokens;
     } catch (error) {
+      // Handle storage retrieval errors with existing multi-tiered fallback logic
       this.storageStats.errors++;
       this.consecutiveErrors++;
 
@@ -260,6 +283,12 @@ export class TokenManager {
           );
           const kvStorage = StorageFactory.createStorage(this.env, "kv");
           const tokens = await kvStorage.getTokens(sessionType);
+
+          // Cache the fallback token
+          this.tokenCache.set(sessionType, {
+            data: tokens,
+            cachedAt: now,
+          });
 
           // If auto mode and error threshold reached, switch to KV permanently
           if (
@@ -283,16 +312,26 @@ export class TokenManager {
                 "redis",
               );
 
-              return await redisStorage.getTokens(sessionType);
+              const tokens = await redisStorage.getTokens(sessionType);
+
+              // Cache the fallback token
+              this.tokenCache.set(sessionType, {
+                data: tokens,
+                cachedAt: now,
+              });
+
+              return tokens;
             } catch (redisError) {
               // If all options fail, throw the original error
               console.error(
                 `All storage options failed: ${error.message}, ${kvError.message}, ${redisError.message}`,
               );
+              this.tokenCache.delete(sessionType); // Clear any potentially stale cache
               throw error;
             }
           } else {
             // If Redis is not available, throw the KV error
+            this.tokenCache.delete(sessionType);
             throw kvError;
           }
         }
@@ -309,6 +348,12 @@ export class TokenManager {
             );
             const tokens = await redisStorage.getTokens(sessionType);
 
+            // Cache the fallback token
+            this.tokenCache.set(sessionType, {
+              data: tokens,
+              cachedAt: now,
+            });
+
             // If auto mode and error threshold reached, switch to Redis permanently
             if (
               this.env.STORAGE_PREFERENCE === "auto" &&
@@ -322,18 +367,20 @@ export class TokenManager {
           } catch (redisError) {
             // If Redis also fails, throw the original error
             console.error(`Redis fallback also failed: ${redisError.message}`);
+            this.tokenCache.delete(sessionType);
             throw error;
           }
         }
       }
 
       // If no fallback options or all fallbacks failed, throw the original error
+      this.tokenCache.delete(sessionType);
       throw error;
     }
   }
 
   /**
-   * Update tokens in storage with tiered approach
+   * Update tokens in storage with cache invalidation
    * @param tokens - Token data
    * @param sessionType - Session type
    */
@@ -341,6 +388,9 @@ export class TokenManager {
     tokens: TokenData,
     sessionType: SessionType,
   ): Promise<void> {
+    // Invalidate cache for the specific session type
+    this.tokenCache.delete(sessionType);
+
     try {
       // Check if we should switch storage before proceeding
       if (this.env.USE_D1 && this.shouldSwitchFromD1ToKV()) {
@@ -366,7 +416,7 @@ export class TokenManager {
       await this.storage.updateTokens(tokens, sessionType);
       this.consecutiveErrors = 0; // Reset error counter on success
 
-      // Implement tiered backup strategy
+      // Existing tiered backup logic
       if (this.env.STORAGE_PREFERENCE === "auto") {
         // If using D1, also update KV as a backup
         if (this.env.USE_D1) {
@@ -393,24 +443,25 @@ export class TokenManager {
               );
             }
           }
-        }
-        // If using KV, also update Redis as a backup if available
-        else if (!this.env.USE_REDIS && this.env.REDIS) {
-          try {
-            console.log(`[STORAGE] Backing up tokens to Redis`);
-            const redisStorage = StorageFactory.createStorage(
-              this.env,
-              "redis",
-            );
-            await redisStorage.updateTokens(tokens, sessionType);
-          } catch (redisError) {
-            console.error(
-              `Failed to update Redis backup: ${redisError.message}`,
-            );
+          // If using KV, also update Redis as a backup if available
+          else if (!this.env.USE_REDIS && this.env.REDIS) {
+            try {
+              console.log(`[STORAGE] Backing up tokens to Redis`);
+              const redisStorage = StorageFactory.createStorage(
+                this.env,
+                "redis",
+              );
+              await redisStorage.updateTokens(tokens, sessionType);
+            } catch (redisError) {
+              console.error(
+                `Failed to update Redis backup: ${redisError.message}`,
+              );
+            }
           }
         }
       }
     } catch (error) {
+      // Existing error handling logic
       this.storageStats.errors++;
       this.consecutiveErrors++;
 
@@ -612,13 +663,23 @@ export class TokenManager {
         updated_at: now.toISOString(),
       };
 
+      // Clear cache for TV tokens
+      this.tokenCache.delete(SessionType.TV);
+
+      // Update TV tokens
       await this.updateTokens(tvTokens, SessionType.TV);
 
+      // If not a TV session, refresh mobile tokens
       if (sessionType !== SessionType.TV) {
         const mobileTokens = await this.refreshMobileToken(
           tvRefreshToken,
           sessionType,
         );
+
+        // Clear cache for mobile tokens
+        this.tokenCache.delete(sessionType);
+
+        // Update mobile tokens
         await this.updateTokens(mobileTokens, sessionType);
         return mobileTokens;
       }
